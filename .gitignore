@@ -1,2 +1,5 @@
 .ipynb_checkpoints/
 models/
+/sql_cot/
+output/*
+swanlog/
