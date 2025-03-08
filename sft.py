@@ -1,7 +1,8 @@
 " download model "
 import os
+import tokenize
 from huggingface_hub import snapshot_download
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DataCollatorForLanguageModeling
 
 model_id = "Qwen/Qwen2.5-Coder-1.5B"
 save_dir = f"/root/autodl-tmp/NL2SQL/models/{model_id[5:]}/"
@@ -9,66 +10,67 @@ os.makedirs(save_dir, exist_ok=True)
 # snapshot_download(repo_id=model_id, local_dir=save_dir)
 
 " Load model "
-model = AutoModelForCausalLM.from_pretrained(save_dir, device_map="auto")
-tokenizer = AutoTokenizer.from_pretrained(save_dir, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained(save_dir, device_map="cuda")
+tokenizer = AutoTokenizer.from_pretrained(save_dir)
 
 " Data process"
 import pandas as pd
+from datasets import Dataset
+
 # system prompt
-system_prompt = """You are DeepQuery, a data science expert. Below, you are presented with a database schema, a question and a hint.Your task is to read the schema with annotations of the columns, understand the question and the hint, and generate a valid SQL query to answer the question. You should reason step by step, and includes your reasonings between <think> and </think>."""
+system_prompt = """You are DeepQuery, a data science expert. Below, you are presented with a database schema, a question and a hint. Your task is to read the schema with annotations of the columns, understand the question and the hint, and generate a valid SQL query to answer the question. You should reason step by step, and include your reasonings between <think> and </think>."""
 
-# SFT dataset
-# CoT enhanced BIRD
-data_dir = '/root/autodl-tmp/NL2SQL/sql-cot/cot-qa.csv'
-
+# 读取 CSV 文件并构造 Dataset
+data_dir = '/root/autodl-tmp/NL2SQL/cot-qa.csv'
 df = pd.read_csv(data_dir)
-# print(df.head(3))
+dataset = Dataset.from_pandas(df)
 
-# query, answer, thinking = df["query"], df["answer"], df["thinking_process"]
-def process_data(row):
-    question, answer, thinking = row["query"], row["answer"], row["thinking_process"]
-    prompt = f"For the question: {question}.\nPlease think step by step, list your thinking process between <think> and </think> and then show the final SQL answer:"
-    completion = f"<think>{thinking}</think>\nMy final answer is: ```sql\n{answer}\n```"
-    return {"prompt": prompt, "completion": completion}
+def combined_preprocess(batch):
+    texts = []
+    # 遍历每个样本，构造完整的 prompt 和 completion 文本
+    for q, a, t in zip(batch["query"], batch["answer"], batch["thinking_process"]):
+        question = str(q)
+        answer = str(a)
+        thinking = str(t)
+        prompt = (
+            f"For the question: {question}.\n"
+            "Please think step by step, list your thinking process between <think> and </think> and then show the final SQL answer:"
+        )
+        completion = (
+            f"<think>{thinking}</think>\nMy final answer is: ```sql\n{answer}\n```"
+        )
+        texts.append(prompt + "\n" + completion)
+    # 不进行 padding, 也不返回 torch.Tensor, 返回的是列表, 让 collator 统一 pad
+    tokenized = tokenizer(
+        texts,
+        truncation=True,
+        max_length=1024 * 2,
+        padding=False,
+    )
+    print(type(tokenized))
+    # print(tokenized.device)
+    return tokenized
 
-training_data = df.apply(process_data, axis=1).tolist()
-print(f"training data size: {len(training_data)}")  # 9399
-
-" Tokenize and Build dataset "
-def tokenize_func(example):
-    text = example["prompt"] + '\n' + example["completion"]
-    return tokenizer(text, truncation=True, max_length=1024*2)
-
-tokenized_data = [tokenize_func(example) for example in training_data]
-
-import torch
-from torch.utils.data import Dataset
-
-class NL2SQLDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-training_dataset = NL2SQLDataset(tokenized_data)
+# 使用 map 时删除原始字段，保证每个样本只包含 tokenized 的输出
+processed_dataset = dataset.map(combined_preprocess, batched=True, remove_columns=dataset.column_names)
+# print(processed_dataset[0])
 
 " Lora Config "
 from peft import LoraConfig, TaskType, get_peft_model
 lora_config = LoraConfig(
     task_type=TaskType.CAUSAL_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     r=8,
-    lora_alpha=8*2,
+    lora_alpha=16,  # 8*2
     lora_dropout=0.05,
-    target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj', 'up_proj', 'down_proj',],
     bias='none',
     inference_mode=False
 )
 
+model.enable_input_require_grads()
 model = get_peft_model(model, lora_config)
+print(model.print_trainable_parameters())
+model.config.use_cache = False
 
 " Training Config "
 from transformers import TrainingArguments, Trainer
@@ -85,13 +87,13 @@ training_args = TrainingArguments(
     save_on_each_node=True,
     gradient_checkpointing=True,
     report_to="none",
+    remove_unused_columns=False,
 )
 
 " Swanlab setup "
 import swanlab
 from swanlab.integration.transformers import SwanLabCallback
 
-# 设置SwanLab回调
 swanlab_callback = SwanLabCallback(
     project="Qwen2.5-Coder-1.5B-NL2SQL-SFT",
     experiment_name="Coder-1.5B-NL2SQL-SFT-CoT-BIRD",
@@ -99,8 +101,8 @@ swanlab_callback = SwanLabCallback(
         "model": "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B",
         "dataset": "https://modelscope.cn/datasets/ruohuaw/sql-cot",
         "github": "https://github.com/Wooonster/NL2SQL",
-        "prompt": "https://github.com/Wooonster/NL2SQL",
-        "train_data_number": len(training_data),
+        "prompt": "",
+        "train_data_number": len(processed_dataset),
         "lora_rank": 8,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
@@ -110,8 +112,8 @@ swanlab_callback = SwanLabCallback(
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=training_dataset,
-    tokenizer=tokenizer,
+    train_dataset=processed_dataset,
+    data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False, return_tensors='pt'),
     callbacks=[swanlab_callback],
 )
 
