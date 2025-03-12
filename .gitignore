@@ -3,3 +3,9 @@ models/
 /sql_cot/
 output/*
 swanlog/
+data/.ipynb_checkpoints/
+data/dev*/
+data/paper/
+data/*.zip
+data/syn_cot_data.json
+data/train_bird.json

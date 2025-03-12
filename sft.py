@@ -21,7 +21,7 @@ from datasets import Dataset
 system_prompt = """You are DeepQuery, a data science expert. Below, you are presented with a database schema, a question and a hint. Your task is to read the schema with annotations of the columns, understand the question and the hint, and generate a valid SQL query to answer the question. You should reason step by step, and include your reasonings between <think> and </think>."""
 
 # 读取 CSV 文件并构造 Dataset
-data_dir = '/root/autodl-tmp/NL2SQL/cot-qa.csv'
+data_dir = '/root/autodl-tmp/NL2SQL/data/cot-qa.csv'
 df = pd.read_csv(data_dir)
 dataset = Dataset.from_pandas(df)
 
